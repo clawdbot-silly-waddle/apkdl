@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import tempfile
 from collections.abc import Callable
@@ -41,7 +42,6 @@ class VersionInfo:
 
     version: str
     date: str
-    url: str
     version_id: str = ""
 
 
@@ -187,7 +187,6 @@ def list_versions(url: str, *, limit: int = 200) -> list[VersionInfo]:
                     VersionInfo(
                         version=item.get("version", ""),
                         date=item.get("lastUpdate", ""),
-                        url=url,
                         version_id=str(
                             item.get("versionURL", {}).get("versionID", "")
                         ),
@@ -289,8 +288,6 @@ def download_apk(
     temp_path = Path(temp_path_str)
     fd_closed = False
     try:
-        import os
-
         with _make_client() as client:
             with client.stream(
                 "GET",
