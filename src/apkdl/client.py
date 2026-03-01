@@ -234,7 +234,7 @@ def get_download_url(url: str, *, version_id: str = "") -> tuple[str, str]:
     # Build a sensible filename
     name_el = soup.select_one("h1#detail-app-name, .detail-app-name")
     name = name_el.get_text(strip=True) if name_el else "app"
-    name_slug = re.sub(r"[^a-zA-Z0-9]+", "-", name).strip("-").lower()
+    name_slug = re.sub(r"[^a-zA-Z0-9]+", "-", name).strip("-").lower() or "app"
 
     ver_el = soup.select_one(".version")
     version = ""
@@ -272,6 +272,8 @@ def download_apk(
     """
     download_url, suggested_name = get_download_url(url, version_id=version_id)
     download_page = url.rstrip("/") + "/download"
+    if version_id:
+        download_page += f"/{version_id}"
 
     out = Path(output_path)
     # Treat as directory if it exists as a dir or the path ends with /
@@ -298,8 +300,9 @@ def download_apk(
                 resp.raise_for_status()
                 total = int(resp.headers.get("content-length", 0))
 
-                with os.fdopen(temp_fd, "wb") as f:
-                    fd_closed = True
+                f = os.fdopen(temp_fd, "wb")
+                fd_closed = True
+                with f:
                     downloaded = 0
                     for chunk in resp.iter_bytes(chunk_size=65536):
                         f.write(chunk)
