@@ -147,40 +147,56 @@ def get_app_info(url: str) -> AppInfo:
     )
 
 
-def list_versions(url: str, *, limit: int = 20) -> list[VersionInfo]:
-    """List available versions for an app."""
-    versions_url = url.rstrip("/") + "/versions"
+def _get_app_code(url: str) -> str:
+    """Extract the app code (numeric ID) from an UpToDown app page."""
     with _make_client() as client:
-        resp = client.get(versions_url)
+        resp = client.get(url.rstrip("/") + "/versions")
         resp.raise_for_status()
 
     soup = BeautifulSoup(resp.text, "html.parser")
+    el = soup.select_one("[data-code]")
+    if el:
+        code = el.get("data-code", "")
+        if code and code.isdigit():
+            return str(code)
+
+    raise RuntimeError(f"Could not find app code on {url}")
+
+
+def list_versions(url: str, *, limit: int = 200) -> list[VersionInfo]:
+    """List available versions for an app using the JSON API."""
+    app_code = _get_app_code(url)
     versions: list[VersionInfo] = []
+    page = 1
 
-    for item in soup.select("div[data-version-id]")[:limit]:
-        ver_el = item.select_one(".version")
-        date_el = item.select_one(".date")
-
-        if not ver_el:
-            continue
-
-        version = ver_el.get_text(strip=True)
-        if not re.match(r"\d+\.\d+", version):
-            continue
-
-        version_id = item.get("data-version-id", "")
-
-        link_el = item.select_one("a[href]")
-        href = link_el.get("href", "") if link_el else ""
-
-        versions.append(
-            VersionInfo(
-                version=version,
-                date=date_el.get_text(strip=True) if date_el else "",
-                url=str(href) if href else url,
-                version_id=str(version_id),
+    with _make_client() as client:
+        while len(versions) < limit:
+            resp = client.get(
+                f"{UPTODOWN_BASE}/android/apps/{app_code}/versions/{page}"
             )
-        )
+            resp.raise_for_status()
+
+            data = resp.json()
+            if not data.get("success") or not data.get("data"):
+                break
+
+            for item in data["data"]:
+                if len(versions) >= limit:
+                    break
+                versions.append(
+                    VersionInfo(
+                        version=item.get("version", ""),
+                        date=item.get("lastUpdate", ""),
+                        url=url,
+                        version_id=str(
+                            item.get("versionURL", {}).get("versionID", "")
+                        ),
+                    )
+                )
+
+            if len(data["data"]) < 20:
+                break
+            page += 1
 
     return versions
 
