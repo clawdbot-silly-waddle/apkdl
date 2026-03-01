@@ -155,7 +155,14 @@ def versions(app: str, limit: int) -> None:
     help="Output directory or file path.",
     show_default=True,
 )
-def download(app: str, output: str) -> None:
+@click.option(
+    "-v",
+    "--version",
+    "ver",
+    default=None,
+    help="Specific version to download (e.g. 43.3.0.110). Use 'apkdl versions' to list.",
+)
+def download(app: str, output: str, ver: str | None) -> None:
     """Download the latest APK for an app.
 
     APP can be an UpToDown URL or a package name (e.g. com.tumblr.tumblr).
@@ -164,7 +171,7 @@ def download(app: str, output: str) -> None:
 
         apkdl download com.tumblr.tumblr
 
-        apkdl download "https://tumblr.en.uptodown.com/android"
+        apkdl download com.tumblr.tumblr -v 43.3.0.110
 
         apkdl download com.tumblr.tumblr -o ~/Downloads/
     """
@@ -172,6 +179,20 @@ def download(app: str, output: str) -> None:
     if not url:
         err_console.print(f"[red]Could not find app: {app}[/red]")
         sys.exit(1)
+
+    # Resolve version string to version_id
+    version_id = ""
+    if ver:
+        with err_console.status(f"Looking up version {ver}..."):
+            try:
+                versions = client.list_versions(url, limit=100)
+            except Exception as e:
+                _handle_error(e)
+        match = next((v for v in versions if v.version == ver), None)
+        if not match:
+            err_console.print(f"[red]Version '{ver}' not found. Use 'apkdl versions' to list available versions.[/red]")
+            sys.exit(1)
+        version_id = match.version_id
 
     err_console.print(f"Resolving download for [bold]{url}[/bold]...")
 
@@ -190,9 +211,9 @@ def download(app: str, output: str) -> None:
                 progress.update(task, total=total, completed=downloaded)
 
         try:
-            download_url, filename = client.get_download_url(url)
+            download_url, filename = client.get_download_url(url, version_id=version_id)
             progress.update(task, filename=filename)
-            saved = client.download_apk(url, output, progress_callback=on_progress)
+            saved = client.download_apk(url, output, version_id=version_id, progress_callback=on_progress)
         except (httpx.HTTPError, RuntimeError, OSError) as e:
             err_console.print(f"[red]Download failed: {e}[/red]")
             sys.exit(1)

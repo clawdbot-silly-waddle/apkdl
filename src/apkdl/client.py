@@ -42,6 +42,7 @@ class VersionInfo:
     version: str
     date: str
     url: str
+    version_id: str = ""
 
 
 def _make_client() -> httpx.Client:
@@ -156,7 +157,7 @@ def list_versions(url: str, *, limit: int = 20) -> list[VersionInfo]:
     soup = BeautifulSoup(resp.text, "html.parser")
     versions: list[VersionInfo] = []
 
-    for item in soup.select("div[data-url]")[:limit]:
+    for item in soup.select("div[data-version-id]")[:limit]:
         ver_el = item.select_one(".version")
         date_el = item.select_one(".date")
 
@@ -167,8 +168,8 @@ def list_versions(url: str, *, limit: int = 20) -> list[VersionInfo]:
         if not re.match(r"\d+\.\d+", version):
             continue
 
-        # The data-url for version items points back to the app page
-        # For downloading a specific version, we need the version-specific page
+        version_id = item.get("data-version-id", "")
+
         link_el = item.select_one("a[href]")
         href = link_el.get("href", "") if link_el else ""
 
@@ -177,22 +178,26 @@ def list_versions(url: str, *, limit: int = 20) -> list[VersionInfo]:
                 version=version,
                 date=date_el.get_text(strip=True) if date_el else "",
                 url=str(href) if href else url,
+                version_id=str(version_id),
             )
         )
 
     return versions
 
 
-def get_download_url(url: str) -> tuple[str, str]:
+def get_download_url(url: str, *, version_id: str = "") -> tuple[str, str]:
     """Get the direct download URL and filename for an app.
 
     Args:
         url: UpToDown app page URL (e.g. https://tumblr.en.uptodown.com/android)
+        version_id: Optional version ID for downloading a specific version.
 
     Returns:
         Tuple of (download_url, suggested_filename)
     """
     download_page = url.rstrip("/") + "/download"
+    if version_id:
+        download_page += f"/{version_id}"
     with _make_client() as client:
         resp = client.get(download_page)
         resp.raise_for_status()
@@ -235,6 +240,7 @@ def download_apk(
     url: str,
     output_path: str,
     *,
+    version_id: str = "",
     progress_callback: Callable[[int, int], None] | None = None,
 ) -> str:
     """Download an APK from UpToDown.
@@ -242,12 +248,13 @@ def download_apk(
     Args:
         url: UpToDown app page URL
         output_path: Directory or file path to save to
+        version_id: Optional version ID for downloading a specific version.
         progress_callback: Optional callable(downloaded_bytes, total_bytes)
 
     Returns:
         Path to the downloaded file
     """
-    download_url, suggested_name = get_download_url(url)
+    download_url, suggested_name = get_download_url(url, version_id=version_id)
     download_page = url.rstrip("/") + "/download"
 
     out = Path(output_path)
