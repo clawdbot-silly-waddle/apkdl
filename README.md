@@ -39,14 +39,14 @@ Accepts an UpToDown URL, a package name, or just an app name.
 ### List available versions
 
 ```
-$ apkdl versions tumblr
+$ apkdl versions tumblr -n 3
          Available versions of Tumblr
 ┏━━━━━━━━━━━━┳━━━━━━┳━━━━━━━━━━┳━━━━━━━━━━━━━━┓
 ┃ Version    ┃ Type ┃ Size     ┃ Date         ┃
 ┡━━━━━━━━━━━━╇━━━━━━╇━━━━━━━━━━╇━━━━━━━━━━━━━━┩
 │ 43.4.0.107 │ xapk │ 34.24 MB │ 24 feb. 2026 │
 │ 43.3.0.110 │ xapk │ 36.11 MB │ 20 feb. 2026 │
-│ ...        │      │          │              │
+│ 43.2.0.110 │ xapk │ 29.8 MB  │ 9 feb. 2026  │
 └────────────┴──────┴──────────┴──────────────┘
 ```
 
