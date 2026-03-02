@@ -59,7 +59,7 @@ def _make_client() -> httpx.Client:
 
 def _generate_eapi_key() -> str:
     """Generate the APIKEY header for the UpToDown internal API."""
-    epoch_hour = int(time.time() * 1000) // 3600000 * 3600
+    epoch_hour = int(time.time()) // 3600 * 3600
     raw = _EAPI_SECRET + str(epoch_hour)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
@@ -85,11 +85,20 @@ def _get_eapi_download_url(app_code: str, file_id: str) -> str:
             },
         )
         resp.raise_for_status()
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Internal API returned non-JSON for app={app_code} file={file_id}"
+            ) from exc
 
-    data = resp.json()
-    if not data.get("success") or not data.get("data", {}).get("downloadURL"):
-        raise RuntimeError("Internal API did not return a download URL")
-    return data["data"]["downloadURL"]
+    dl_url = data.get("data", {}).get("downloadURL", "")
+    if not data.get("success") or not dl_url:
+        raise RuntimeError(
+            f"Internal API did not return a download URL "
+            f"(app={app_code}, file={file_id})"
+        )
+    return dl_url
 
 
 def search(query: str, *, limit: int = 20) -> list[AppInfo]:
@@ -283,7 +292,7 @@ def get_download_url(url: str, *, version_id: str = "") -> tuple[str, str]:
     if is_xapk:
         # For XAPK apps, the web page token downloads the UpToDown store
         # app instead of the actual file.  Use the internal API instead.
-        app_code = (name_el.get("data-code", "") if name_el else "") or ""
+        app_code = (name_el.get("data-code", "") if name_el else "")
         file_id = btn.get("data-download-version", "") or version_id
         if not app_code or not file_id:
             raise RuntimeError(
