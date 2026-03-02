@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import tempfile
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +22,8 @@ USER_AGENT = (
 
 UPTODOWN_BASE = "https://en.uptodown.com"
 UPTODOWN_DW = "https://dw.uptodown.com/dwn"
+UPTODOWN_EAPI = "https://www.uptodown.app:443"
+_EAPI_SECRET = "$(=a%·!45J&S"
 
 
 @dataclass
@@ -51,6 +55,41 @@ def _make_client() -> httpx.Client:
         follow_redirects=True,
         timeout=30.0,
     )
+
+
+def _generate_eapi_key() -> str:
+    """Generate the APIKEY header for the UpToDown internal API."""
+    epoch_hour = int(time.time() * 1000) // 3600000 * 3600
+    raw = _EAPI_SECRET + str(epoch_hour)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _get_eapi_download_url(app_code: str, file_id: str) -> str:
+    """Get the real download URL via the UpToDown internal API.
+
+    This bypasses the web page's redirect to the UpToDown store app
+    that occurs for XAPK-format downloads.
+    """
+    url = f"{UPTODOWN_EAPI}/eapi/apps/{app_code}/file/{file_id}/downloadUrl"
+    with httpx.Client(timeout=15.0) as client:
+        resp = client.get(
+            url,
+            params={"update": "0"},
+            headers={
+                "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 13)",
+                "Identificador": "Uptodown_Android",
+                "Identificador-Version": "711",
+                "APIKEY": _generate_eapi_key(),
+                "Accept": "application/json",
+                "Accept-Charset": "utf-8",
+            },
+        )
+        resp.raise_for_status()
+
+    data = resp.json()
+    if not data.get("success") or not data.get("data", {}).get("downloadURL"):
+        raise RuntimeError("Internal API did not return a download URL")
+    return data["data"]["downloadURL"]
 
 
 def search(query: str, *, limit: int = 20) -> list[AppInfo]:
@@ -224,11 +263,7 @@ def get_download_url(url: str, *, version_id: str = "") -> tuple[str, str]:
     if not btn:
         raise RuntimeError("Could not find download button on page")
 
-    token = btn.get("data-url", "")
-    if not token or len(token) < 20:
-        raise RuntimeError(f"Invalid download token: {token!r}")
-
-    download_url = f"{UPTODOWN_DW}/{token}"
+    is_xapk = "xapk" in btn.get("class", [])
 
     # Build a sensible filename
     name_el = soup.select_one("h1#detail-app-name, .detail-app-name")
@@ -242,11 +277,24 @@ def get_download_url(url: str, *, version_id: str = "") -> tuple[str, str]:
         if re.match(r"\d+\.\d+", text):
             version = text
 
-    ext = "apk"
-    if "xapk" in btn.get("class", []):
-        ext = "xapk"
-
+    ext = "xapk" if is_xapk else "apk"
     filename = f"{name_slug}-{version}.{ext}" if version else f"{name_slug}.{ext}"
+
+    if is_xapk:
+        # For XAPK apps, the web page token downloads the UpToDown store
+        # app instead of the actual file.  Use the internal API instead.
+        app_code = (name_el.get("data-code", "") if name_el else "") or ""
+        file_id = btn.get("data-download-version", "") or version_id
+        if not app_code or not file_id:
+            raise RuntimeError(
+                "Could not determine app code / file ID for XAPK download"
+            )
+        download_url = _get_eapi_download_url(app_code, file_id)
+    else:
+        token = btn.get("data-url", "")
+        if not token or len(token) < 20:
+            raise RuntimeError(f"Invalid download token: {token!r}")
+        download_url = f"{UPTODOWN_DW}/{token}"
 
     return download_url, filename
 
