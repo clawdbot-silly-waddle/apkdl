@@ -10,20 +10,21 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
+from urllib.parse import quote
 
 import httpx
-from bs4 import BeautifulSoup
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/120.0.0.0 Safari/537.36"
-)
-
-UPTODOWN_BASE = "https://en.uptodown.com"
-UPTODOWN_DW = "https://dw.uptodown.com/dwn"
-UPTODOWN_EAPI = "https://www.uptodown.app:443"
+UPTODOWN_EAPI = "https://www.uptodown.app"
 _EAPI_SECRET = "$(=a%·!45J&S"
+_EAPI_HEADERS = {
+    "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 13)",
+    "Identificador": "Uptodown_Android",
+    "Identificador-Version": "711",
+    "Accept": "application/json",
+    "Accept-Charset": "utf-8",
+}
+_DEVICE_ID = "0000000000000000"
 
 
 @dataclass
@@ -31,10 +32,11 @@ class AppInfo:
     """Metadata about an app on UpToDown."""
 
     name: str
+    app_code: str
     package: str
     version: str
     size: str
-    url: str  # UpToDown page URL
+    url: str
     icon_url: str | None = None
     developer: str | None = None
     description: str | None = None
@@ -46,15 +48,10 @@ class VersionInfo:
 
     version: str
     date: str
-    version_id: str = ""
-
-
-def _make_client() -> httpx.Client:
-    return httpx.Client(
-        headers={"User-Agent": USER_AGENT},
-        follow_redirects=True,
-        timeout=30.0,
-    )
+    file_id: str
+    file_type: str = "apk"
+    size: str = ""
+    sha256: str = ""
 
 
 def _generate_eapi_key() -> str:
@@ -64,303 +61,189 @@ def _generate_eapi_key() -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def _get_eapi_download_url(app_code: str, file_id: str) -> str:
-    """Get the real download URL via the UpToDown internal API.
-
-    This bypasses the web page's redirect to the UpToDown store app
-    that occurs for XAPK-format downloads.
-    """
-    url = f"{UPTODOWN_EAPI}/eapi/apps/{app_code}/file/{file_id}/downloadUrl"
+def _eapi_get(path: str, params: dict[str, str] | None = None) -> Any:
+    """Make an authenticated GET request to the UpToDown internal API."""
+    headers = {**_EAPI_HEADERS, "APIKEY": _generate_eapi_key()}
     with httpx.Client(timeout=15.0) as client:
         resp = client.get(
-            url,
-            params={"update": "0"},
-            headers={
-                "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 13)",
-                "Identificador": "Uptodown_Android",
-                "Identificador-Version": "711",
-                "APIKEY": _generate_eapi_key(),
-                "Accept": "application/json",
-                "Accept-Charset": "utf-8",
-            },
+            f"{UPTODOWN_EAPI}{path}",
+            params=params,
+            headers=headers,
         )
         resp.raise_for_status()
         try:
             data = resp.json()
         except ValueError as exc:
             raise RuntimeError(
-                f"Internal API returned non-JSON for app={app_code} file={file_id}"
+                f"API returned non-JSON for {path}"
             ) from exc
+    if isinstance(data, dict) and "success" in data and not data["success"]:
+        raise RuntimeError(f"API error for {path}: {data}")
+    return data
 
-    dl_url = data.get("data", {}).get("downloadURL", "")
-    if not data.get("success") or not dl_url:
-        raise RuntimeError(
-            f"Internal API did not return a download URL "
-            f"(app={app_code}, file={file_id})"
-        )
-    return dl_url
+
+def human_size(size_bytes: int) -> str:
+    """Format bytes as human-readable size."""
+    value = float(size_bytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024:
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} TB"
 
 
 def search(query: str, *, limit: int = 20) -> list[AppInfo]:
     """Search for apps on UpToDown by name."""
-    with _make_client() as client:
-        resp = client.post(
-            f"{UPTODOWN_BASE}/android/en/s",
-            data={"queryString": query},
-        )
-        resp.raise_for_status()
-
-    data = resp.json()
-    if not data.get("success") or not data.get("data"):
-        return []
-
+    data = _eapi_get(
+        f"/eapi/v2/apps/search/{quote(query, safe='')}",
+        {"page[limit]": str(limit), "page[offset]": "0"},
+    )
     results: list[AppInfo] = []
-    for app in data["data"].get("apps", [])[:limit]:
-        name = re.sub(r"<[^>]+>", "", app.get("name", ""))
-        url = app.get("url", "")
-
-        # Extract slug from URL: https://{slug}.en.uptodown.com/android
-        slug_match = re.search(r"//([^.]+)\.", url)
-        slug = slug_match.group(1) if slug_match else ""
-
+    for app in data.get("data", {}).get("results", [])[:limit]:
         results.append(
             AppInfo(
-                name=name,
-                package=slug,
+                name=app.get("name", ""),
+                app_code=str(app.get("appID", "")),
+                package=app.get("packageName", "") or app.get("packagename", ""),
                 version="",
                 size="",
-                url=url,
+                url="",
+                icon_url=app.get("iconURL"),
+                developer=app.get("author") or None,
             )
         )
-
     return results
 
 
-def get_app_info(url: str) -> AppInfo:
-    """Get detailed app info from an UpToDown app page URL."""
-    with _make_client() as client:
-        resp = client.get(url)
-        resp.raise_for_status()
+def get_app_info(app_code: str) -> AppInfo:
+    """Get detailed app info by app code."""
+    data = _eapi_get(f"/eapi/v3/apps/{app_code}/device/{_DEVICE_ID}")
+    d = data.get("data", data)
 
-    soup = BeautifulSoup(resp.text, "html.parser")
+    # Get latest version string from versions endpoint
+    versions = list_versions(app_code, limit=1)
+    version = versions[0].version if versions else ""
 
-    name_el = soup.select_one("h1#detail-app-name")
-    name = name_el.get_text(strip=True) if name_el else "Unknown"
-
-    version = "unknown"
-    for ver_el in soup.select(".version"):
-        text = ver_el.get_text(strip=True)
-        if re.match(r"\d+\.\d+", text):
-            version = text
-            break
-
-    # Try to find package name from Play Store link
-    package = ""
-    play_link = soup.select_one('a[href*="play.google.com"]')
-    if play_link:
-        m = re.search(r"id=([^&]+)", play_link.get("href", ""))
-        if m:
-            package = m.group(1)
-
-    # Technical info (size, etc.)
-    size = ""
-    for row in soup.select(".technical-information .full tr, .info-item"):
-        text = row.get_text()
-        if "size" in text.lower() or "tamaño" in text.lower():
-            size_match = re.search(r"[\d.,]+\s*[KMGT]?B", text)
-            if size_match:
-                size = size_match.group()
-
-    # Get description
-    desc_el = soup.select_one("#detail-description")
-    desc = desc_el.get_text(strip=True)[:200] if desc_el else None
-
-    # Icon
-    icon_el = soup.select_one("img.detail-icon, img#detail-icon")
-    icon_url = icon_el.get("src") if icon_el else None
-
-    # Developer
-    dev_el = soup.select_one(".developer, .author")
-    developer = dev_el.get_text(strip=True) if dev_el else None
-
+    size_bytes = d.get("size", 0)
     return AppInfo(
-        name=name,
-        package=package,
+        name=d.get("name", "Unknown"),
+        app_code=str(d.get("appID", app_code)),
+        package=d.get("packagename", ""),
         version=version,
-        size=size,
-        url=url,
-        icon_url=str(icon_url) if icon_url else None,
-        developer=developer,
-        description=desc,
+        size=_human_size(size_bytes) if size_bytes else "",
+        url=d.get("urlShare", ""),
+        icon_url=d.get("icon"),
+        developer=d.get("author") or None,
+        description=d.get("shortDescription") or None,
     )
 
 
-def _get_app_code(url: str) -> str:
-    """Extract the app code (numeric ID) from an UpToDown app page."""
-    with _make_client() as client:
-        resp = client.get(url.rstrip("/") + "/versions")
-        resp.raise_for_status()
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-    el = soup.select_one("[data-code]")
-    if el:
-        code = el.get("data-code", "")
-        if code and code.isdigit():
-            return str(code)
-
-    raise RuntimeError(f"Could not find app code on {url}")
-
-
-def list_versions(url: str, *, limit: int = 200) -> list[VersionInfo]:
-    """List available versions for an app using the JSON API."""
-    app_code = _get_app_code(url)
+def list_versions(app_code: str, *, limit: int = 200) -> list[VersionInfo]:
+    """List available versions for an app."""
     versions: list[VersionInfo] = []
-    page = 1
+    offset = 0
+    page_size = min(limit, 50)
 
-    with _make_client() as client:
-        while len(versions) < limit:
-            resp = client.get(
-                f"{UPTODOWN_BASE}/android/apps/{app_code}/versions/{page}"
-            )
-            resp.raise_for_status()
+    while len(versions) < limit:
+        data = _eapi_get(
+            f"/eapi/v3/app/{app_code}/device/{_DEVICE_ID}/compatible/versions",
+            {"page[limit]": str(page_size), "page[offset]": str(offset)},
+        )
+        items = data.get("data", [])
+        if not items:
+            break
 
-            data = resp.json()
-            if not data.get("success") or not data.get("data"):
+        for item in items:
+            if len(versions) >= limit:
                 break
-
-            for item in data["data"]:
-                if len(versions) >= limit:
-                    break
-                versions.append(
-                    VersionInfo(
-                        version=item.get("version", ""),
-                        date=item.get("lastUpdate", ""),
-                        version_id=str(
-                            item.get("versionURL", {}).get("versionID", "")
-                        ),
-                    )
+            versions.append(
+                VersionInfo(
+                    version=item.get("version", ""),
+                    date=item.get("lastUpdate", ""),
+                    file_id=str(item.get("fileID", "")),
+                    file_type=item.get("fileType", "apk"),
+                    size=item.get("size", ""),
+                    sha256=item.get("sha256", ""),
                 )
+            )
 
-            if len(data["data"]) < 20:
-                break
-            page += 1
+        if len(items) < page_size:
+            break
+        offset += page_size
 
     return versions
 
 
-def get_download_url(url: str, *, version_id: str = "") -> tuple[str, str]:
-    """Get the direct download URL and filename for an app.
-
-    Args:
-        url: UpToDown app page URL (e.g. https://tumblr.en.uptodown.com/android)
-        version_id: Optional version ID for downloading a specific version.
+def get_download_url(app_code: str, file_id: str) -> tuple[str, str | None]:
+    """Get the direct download URL for an app file.
 
     Returns:
-        Tuple of (download_url, suggested_filename)
+        Tuple of (download_url, sha256_or_none)
     """
-    download_page = url.rstrip("/") + "/download"
-    if version_id:
-        download_page += f"/{version_id}"
-    with _make_client() as client:
-        resp = client.get(download_page)
-        resp.raise_for_status()
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    # Find the download button with the data-url token
-    btn = soup.select_one("#detail-download-button")
-    if not btn:
-        raise RuntimeError("Could not find download button on page")
-
-    is_xapk = "xapk" in btn.get("class", [])
-
-    # Build a sensible filename
-    name_el = soup.select_one("h1#detail-app-name, .detail-app-name")
-    name = name_el.get_text(strip=True) if name_el else "app"
-    name_slug = re.sub(r"[^a-zA-Z0-9]+", "-", name).strip("-").lower() or "app"
-
-    ver_el = soup.select_one(".version")
-    version = ""
-    if ver_el:
-        text = ver_el.get_text(strip=True)
-        if re.match(r"\d+\.\d+", text):
-            version = text
-
-    ext = "xapk" if is_xapk else "apk"
-    filename = f"{name_slug}-{version}.{ext}" if version else f"{name_slug}.{ext}"
-
-    if is_xapk:
-        # For XAPK apps, the web page token downloads the UpToDown store
-        # app instead of the actual file.  Use the internal API instead.
-        app_code = (name_el.get("data-code", "") if name_el else "")
-        file_id = btn.get("data-download-version", "") or version_id
-        if not app_code or not file_id:
-            raise RuntimeError(
-                "Could not determine app code / file ID for XAPK download"
-            )
-        download_url = _get_eapi_download_url(app_code, file_id)
-    else:
-        token = btn.get("data-url", "")
-        if not token or len(token) < 20:
-            raise RuntimeError(f"Invalid download token: {token!r}")
-        download_url = f"{UPTODOWN_DW}/{token}"
-
-    return download_url, filename
+    data = _eapi_get(
+        f"/eapi/apps/{app_code}/file/{file_id}/downloadUrl",
+        {"update": "0"},
+    )
+    dl_data = data.get("data", {})
+    dl_url = dl_data.get("downloadURL", "")
+    if not dl_url:
+        raise RuntimeError(
+            f"API did not return a download URL (app={app_code}, file={file_id})"
+        )
+    return dl_url, dl_data.get("sha256")
 
 
-def download_apk(
-    url: str,
+def download_file(
+    download_url: str,
     output_path: str,
+    filename: str,
     *,
-    version_id: str = "",
+    expected_sha256: str | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
 ) -> str:
-    """Download an APK from UpToDown.
+    """Download a file from a CDN URL.
 
     Args:
-        url: UpToDown app page URL
+        download_url: Direct download URL from get_download_url()
         output_path: Directory or file path to save to
-        version_id: Optional version ID for downloading a specific version.
+        filename: Suggested filename (used when output_path is a directory)
+        expected_sha256: Optional SHA256 hash to verify after download
         progress_callback: Optional callable(downloaded_bytes, total_bytes)
 
     Returns:
         Path to the downloaded file
     """
-    download_url, suggested_name = get_download_url(url, version_id=version_id)
-    download_page = url.rstrip("/") + "/download"
-    if version_id:
-        download_page += f"/{version_id}"
-
     out = Path(output_path)
-    # Treat as directory if it exists as a dir or the path ends with /
     if out.is_dir() or str(output_path).endswith(("/", "\\")):
-        out = out / suggested_name
+        out = out / filename
 
     out.parent.mkdir(parents=True, exist_ok=True)
 
-    # Download to a temp file, then atomically rename on success
     temp_fd, temp_path_str = tempfile.mkstemp(
         dir=out.parent, suffix=".tmp", prefix=".apkdl-"
     )
     temp_path = Path(temp_path_str)
     fd_closed = False
     try:
-        with _make_client() as client:
-            with client.stream(
-                "GET",
-                download_url,
-                headers={"Referer": download_page},
-            ) as resp:
+        headers = {"User-Agent": _EAPI_HEADERS["User-Agent"]}
+        with httpx.Client(follow_redirects=True, timeout=120.0) as client:
+            with client.stream("GET", download_url, headers=headers) as resp:
                 resp.raise_for_status()
                 total = int(resp.headers.get("content-length", 0))
 
                 f = os.fdopen(temp_fd, "wb")
                 fd_closed = True
+                downloaded = 0
+
+                if expected_sha256:
+                    sha_hash = hashlib.sha256()
+
                 with f:
-                    downloaded = 0
                     for chunk in resp.iter_bytes(chunk_size=65536):
                         f.write(chunk)
                         downloaded += len(chunk)
+                        if expected_sha256:
+                            sha_hash.update(chunk)
                         if progress_callback:
                             progress_callback(downloaded, total)
 
@@ -372,6 +255,13 @@ def download_apk(
                 f"Download incomplete: got {downloaded} bytes, expected {total}"
             )
 
+        if expected_sha256:
+            actual = sha_hash.hexdigest()
+            if actual != expected_sha256:
+                raise RuntimeError(
+                    f"SHA256 mismatch: expected {expected_sha256}, got {actual}"
+                )
+
         temp_path.replace(out)
     except BaseException:
         if not fd_closed:
@@ -382,53 +272,41 @@ def download_apk(
     return str(out)
 
 
-def resolve_package_url(package_name: str) -> str | None:
-    """Try to find an UpToDown URL for a given Android package name.
+def resolve_app(identifier: str) -> tuple[str, str]:
+    """Resolve a user-provided identifier to (app_code, app_name).
 
-    Searches UpToDown and checks Play Store links on result pages
-    to match the exact package name.
+    Accepts:
+        - UpToDown URL (https://tumblr.en.uptodown.com/android)
+        - Android package name (com.tumblr)
+        - App name for search (tumblr)
+
+    Returns:
+        Tuple of (app_code, app_name)
     """
-    # Try multiple search strategies: full package name, then last part(s)
-    queries = [package_name]
-    parts = package_name.split(".")
-    if len(parts) >= 2:
-        queries.append(parts[-1])  # e.g. "tumblr"
-    if len(parts) >= 3:
-        queries.append(f"{parts[-2]} {parts[-1]}")  # e.g. "tumblr tumblr"
+    # URL: extract slug and search for it
+    if identifier.startswith(("http://", "https://")):
+        slug_match = re.search(r"//([^.]+)\.", identifier)
+        if slug_match:
+            slug = slug_match.group(1).replace("-", " ")
+            results = search(slug, limit=1)
+            if results:
+                return results[0].app_code, results[0].name
+        raise RuntimeError(f"Could not resolve URL: {identifier}")
 
-    all_results: list[AppInfo] = []
-    seen_urls: set[str] = set()
-    for q in queries:
-        for r in search(q, limit=10):
-            if r.url not in seen_urls:
-                all_results.append(r)
-                seen_urls.add(r.url)
+    # Package name (has dots): look up directly
+    if "." in identifier:
+        try:
+            data = _eapi_get(f"/eapi/apps/byPackagename/{identifier}")
+            app_code = str(data.get("data", {}).get("appID", ""))
+            if app_code:
+                info = get_app_info(app_code)
+                return app_code, info.name
+        except (httpx.HTTPError, RuntimeError):
+            pass
 
-    if not all_results:
-        return None
+    # Fall back to search
+    results = search(identifier, limit=1)
+    if results:
+        return results[0].app_code, results[0].name
 
-    # Check each result's detail page for a matching Play Store link
-    with _make_client() as client:
-        for result in all_results:
-            try:
-                resp = client.get(result.url)
-                resp.raise_for_status()
-            except httpx.HTTPError:
-                continue
-
-            if f"id={package_name}" in resp.text:
-                return result.url
-
-            soup = BeautifulSoup(resp.text, "html.parser")
-            for a_tag in soup.select("a[href*='play.google.com']"):
-                href = a_tag.get("href", "")
-                if f"id={package_name}" in href:
-                    return result.url
-
-    # Fallback: return first result if the app name slug matches
-    pkg_slug = parts[-1].lower()
-    for result in all_results:
-        if pkg_slug in result.url.lower():
-            return result.url
-
-    return None
+    raise RuntimeError(f"Could not find app: {identifier}")

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
+from typing import NoReturn
 
 import click
 import httpx
@@ -24,7 +26,7 @@ console = Console()
 err_console = Console(stderr=True)
 
 
-def _handle_error(e: Exception) -> None:
+def _handle_error(e: Exception) -> NoReturn:
     """Print a user-friendly error message and exit."""
     if isinstance(e, httpx.TimeoutException):
         err_console.print(f"[red]Request timed out: {e}[/red]")
@@ -66,11 +68,11 @@ def search(query: str, limit: int) -> None:
     table = Table(title=f"Search results for '{query}'")
     table.add_column("#", style="dim", width=3)
     table.add_column("Name", style="bold")
-    table.add_column("Version")
-    table.add_column("URL", style="dim")
+    table.add_column("Package")
+    table.add_column("ID", style="dim")
 
     for i, app in enumerate(results, 1):
-        table.add_row(str(i), app.name, app.version, app.url)
+        table.add_row(str(i), app.name, app.package, app.app_code)
 
     console.print(table)
 
@@ -80,16 +82,12 @@ def search(query: str, limit: int) -> None:
 def info(app: str) -> None:
     """Show detailed info about an app.
 
-    APP can be an UpToDown URL or a package name (e.g. com.tumblr.tumblr).
+    APP can be an UpToDown URL, a package name (e.g. com.tumblr), or a search term.
     """
-    url = _resolve_app(app)
-    if not url:
-        err_console.print(f"[red]Could not find app: {app}[/red]")
-        sys.exit(1)
-
     try:
-        with err_console.status("Fetching app info..."):
-            app_info = client.get_app_info(url)
+        with err_console.status("Resolving app..."):
+            app_code, _ = client.resolve_app(app)
+            app_info = client.get_app_info(app_code)
     except Exception as e:
         _handle_error(e)
 
@@ -105,7 +103,8 @@ def info(app: str) -> None:
         table.add_row("Size", app_info.size)
     if app_info.developer:
         table.add_row("Developer", app_info.developer)
-    table.add_row("URL", app_info.url)
+    if app_info.url:
+        table.add_row("URL", app_info.url)
     if app_info.description:
         table.add_row("Description", app_info.description)
 
@@ -118,16 +117,13 @@ def info(app: str) -> None:
 def versions(app: str, limit: int) -> None:
     """List available versions of an app.
 
-    APP can be an UpToDown URL or a package name.
+    APP can be an UpToDown URL, a package name, or a search term.
     """
-    url = _resolve_app(app)
-    if not url:
-        err_console.print(f"[red]Could not find app: {app}[/red]")
-        sys.exit(1)
-
     try:
-        with err_console.status("Fetching versions..."):
-            vers = client.list_versions(url, limit=limit)
+        with err_console.status("Resolving app..."):
+            app_code, app_name = client.resolve_app(app)
+        with err_console.status(f"Fetching versions for {app_name}..."):
+            vers = client.list_versions(app_code, limit=limit)
     except Exception as e:
         _handle_error(e)
 
@@ -135,12 +131,14 @@ def versions(app: str, limit: int) -> None:
         err_console.print("[yellow]No versions found.[/yellow]")
         sys.exit(1)
 
-    table = Table(title="Available versions")
+    table = Table(title=f"Available versions of {app_name}")
     table.add_column("Version", style="bold")
+    table.add_column("Type")
+    table.add_column("Size")
     table.add_column("Date")
 
     for v in vers:
-        table.add_row(v.version, v.date)
+        table.add_row(v.version, v.file_type, v.size, v.date)
 
     console.print(table)
 
@@ -165,36 +163,47 @@ def versions(app: str, limit: int) -> None:
 def download(app: str, output: str, ver: str | None) -> None:
     """Download the latest APK for an app.
 
-    APP can be an UpToDown URL or a package name (e.g. com.tumblr.tumblr).
+    APP can be an UpToDown URL, a package name (e.g. com.tumblr), or a search term.
 
     Examples:
 
-        apkdl download com.tumblr.tumblr
+        apkdl download com.tumblr
 
-        apkdl download com.tumblr.tumblr -v 43.3.0.110
+        apkdl download com.tumblr -v 43.3.0.110
 
-        apkdl download com.tumblr.tumblr -o ~/Downloads/
+        apkdl download tumblr -o ~/Downloads/
     """
-    url = _resolve_app(app)
-    if not url:
-        err_console.print(f"[red]Could not find app: {app}[/red]")
+    try:
+        with err_console.status("Resolving app..."):
+            app_code, app_name = client.resolve_app(app)
+            all_versions = client.list_versions(app_code, limit=100)
+    except Exception as e:
+        _handle_error(e)
+
+    if not all_versions:
+        err_console.print("[red]No versions available.[/red]")
         sys.exit(1)
 
-    # Resolve version string to version_id
-    version_id = ""
+    # Find the target version
     if ver:
-        with err_console.status(f"Looking up version {ver}..."):
-            try:
-                versions = client.list_versions(url, limit=100)
-            except Exception as e:
-                _handle_error(e)
-        match = next((v for v in versions if v.version == ver), None)
+        match = next((v for v in all_versions if v.version == ver), None)
         if not match:
-            err_console.print(f"[red]Version '{ver}' not found. Use 'apkdl versions' to list available versions.[/red]")
+            err_console.print(
+                f"[red]Version '{ver}' not found. Use 'apkdl versions' to list.[/red]"
+            )
             sys.exit(1)
-        version_id = match.version_id
+        target = match
+    else:
+        target = all_versions[0]
 
-    err_console.print(f"Resolving download for [bold]{url}[/bold]...")
+    # Build filename
+    name_slug = re.sub(r"[^a-zA-Z0-9]+", "-", app_name).strip("-").lower() or "app"
+    ext = target.file_type or "apk"
+    filename = f"{name_slug}-{target.version}.{ext}"
+
+    err_console.print(
+        f"Downloading [bold]{app_name}[/bold] {target.version} ({target.file_type})..."
+    )
 
     with Progress(
         TextColumn("[bold blue]{task.fields[filename]}", justify="right"),
@@ -204,16 +213,21 @@ def download(app: str, output: str, ver: str | None) -> None:
         TimeRemainingColumn(),
         console=err_console,
     ) as progress:
-        task = progress.add_task("download", filename="Preparing...", total=None)
+        task = progress.add_task("download", filename=filename, total=None)
 
         def on_progress(downloaded: int, total: int) -> None:
             if total:
                 progress.update(task, total=total, completed=downloaded)
 
         try:
-            download_url, filename = client.get_download_url(url, version_id=version_id)
-            progress.update(task, filename=filename)
-            saved = client.download_apk(url, output, version_id=version_id, progress_callback=on_progress)
+            download_url, sha256 = client.get_download_url(app_code, target.file_id)
+            saved = client.download_file(
+                download_url,
+                output,
+                filename,
+                expected_sha256=sha256,
+                progress_callback=on_progress,
+            )
         except (httpx.HTTPError, RuntimeError, OSError) as e:
             err_console.print(f"[red]Download failed: {e}[/red]")
             sys.exit(1)
@@ -221,41 +235,4 @@ def download(app: str, output: str, ver: str | None) -> None:
     console.print(f"[green]✓[/green] Saved to [bold]{saved}[/bold]")
 
     size = Path(saved).stat().st_size
-    console.print(f"  Size: {_human_size(size)}")
-
-
-def _resolve_app(app: str) -> str | None:
-    """Resolve an app identifier to an UpToDown URL."""
-    if app.startswith("http://") or app.startswith("https://"):
-        return app
-
-    # Looks like a package name (has dots)
-    if "." in app:
-        with err_console.status(f"Resolving package '{app}'..."):
-            try:
-                url = client.resolve_package_url(app)
-            except Exception:
-                url = None
-        if url:
-            return url
-
-    # Try as a search query and take first result
-    with err_console.status(f"Searching for '{app}'..."):
-        try:
-            results = client.search(app, limit=1)
-        except Exception:
-            results = []
-    if results:
-        return results[0].url
-
-    return None
-
-
-def _human_size(size: int | float) -> str:
-    """Format bytes as human-readable size."""
-    value = float(size)
-    for unit in ("B", "KB", "MB", "GB"):
-        if value < 1024:
-            return f"{value:.1f} {unit}"
-        value /= 1024
-    return f"{value:.1f} TB"
+    console.print(f"  Size: {client.human_size(size)}")
