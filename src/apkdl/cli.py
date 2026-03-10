@@ -185,7 +185,7 @@ def download(app: str, output: str, ver: str | None, extract_apk: bool) -> None:
     try:
         with err_console.status("Resolving app..."):
             app_code, app_name = client.resolve_app(app)
-            all_versions = client.list_versions(app_code, limit=100)
+            all_versions = client.list_versions(app_code, limit=200)
     except Exception as e:
         _handle_error(e)
 
