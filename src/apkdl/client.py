@@ -7,6 +7,7 @@ import os
 import re
 import tempfile
 import time
+import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -130,7 +131,7 @@ def get_app_info(app_code: str) -> AppInfo:
         app_code=str(d.get("appID", app_code)),
         package=d.get("packagename", ""),
         version=version,
-        size=_human_size(size_bytes) if size_bytes else "",
+        size=human_size(size_bytes) if size_bytes else "",
         url=d.get("urlShare", ""),
         icon_url=d.get("icon"),
         developer=d.get("author") or None,
@@ -310,3 +311,54 @@ def resolve_app(identifier: str) -> tuple[str, str]:
         return results[0].app_code, results[0].name
 
     raise RuntimeError(f"Could not find app: {identifier}")
+
+
+def extract_base_apk(xapk_path: str, output_path: str | None = None) -> str:
+    """Extract the base APK from an XAPK (split APK bundle).
+
+    The base APK is identified as the largest .apk entry, or the one matching
+    the package name pattern (e.g. com.tumblr.apk). Config splits (config.*.apk)
+    are skipped.
+
+    Args:
+        xapk_path: Path to the .xapk file
+        output_path: Optional output path. Defaults to replacing .xapk with .apk
+
+    Returns:
+        Path to the extracted APK file
+    """
+    xapk = Path(xapk_path)
+    if not xapk.exists():
+        raise FileNotFoundError(f"XAPK not found: {xapk_path}")
+
+    with zipfile.ZipFile(xapk) as z:
+        apk_entries = [
+            n for n in z.namelist()
+            if n.endswith(".apk") and not n.startswith("config.")
+        ]
+
+        if not apk_entries:
+            raise RuntimeError(f"No base APK found in {xapk_path}")
+
+        # Pick the largest non-config APK as the base
+        base_entry = max(apk_entries, key=lambda n: z.getinfo(n).file_size)
+
+        out = Path(output_path) if output_path else xapk.with_suffix(".apk")
+        if out.is_dir():
+            out = out / base_entry
+
+        temp_fd, temp_path_str = tempfile.mkstemp(
+            dir=out.parent, suffix=".tmp", prefix=".apkdl-"
+        )
+        temp_path = Path(temp_path_str)
+        try:
+            with os.fdopen(temp_fd, "wb") as f_out:
+                with z.open(base_entry) as f_in:
+                    while chunk := f_in.read(65536):
+                        f_out.write(chunk)
+            temp_path.replace(out)
+        except BaseException:
+            temp_path.unlink(missing_ok=True)
+            raise
+
+    return str(out)

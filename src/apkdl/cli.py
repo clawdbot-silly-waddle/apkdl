@@ -160,7 +160,14 @@ def versions(app: str, limit: int) -> None:
     default=None,
     help="Specific version to download (e.g. 43.3.0.110). Use 'apkdl versions' to list.",
 )
-def download(app: str, output: str, ver: str | None) -> None:
+@click.option(
+    "--apk",
+    "extract_apk",
+    is_flag=True,
+    default=False,
+    help="Extract base APK from XAPK bundles. Removes the XAPK after extraction.",
+)
+def download(app: str, output: str, ver: str | None, extract_apk: bool) -> None:
     """Download the latest APK for an app.
 
     APP can be an UpToDown URL, a package name (e.g. com.tumblr), or a search term.
@@ -172,6 +179,8 @@ def download(app: str, output: str, ver: str | None) -> None:
         apkdl download com.tumblr -v 43.3.0.110
 
         apkdl download tumblr -o ~/Downloads/
+
+        apkdl download tumblr --apk
     """
     try:
         with err_console.status("Resolving app..."):
@@ -232,7 +241,27 @@ def download(app: str, output: str, ver: str | None) -> None:
             err_console.print(f"[red]Download failed: {e}[/red]")
             sys.exit(1)
 
-    console.print(f"[green]✓[/green] Saved to [bold]{saved}[/bold]")
+    saved_path = Path(saved)
+    size = saved_path.stat().st_size
 
-    size = Path(saved).stat().st_size
+    if extract_apk and target.file_type == "xapk":
+        err_console.print("Extracting base APK from XAPK bundle...")
+        try:
+            apk_filename = f"{name_slug}-{target.version}.apk"
+            out_dir = Path(output) if Path(output).is_dir() else saved_path.parent
+            apk_path = str(out_dir / apk_filename)
+            extracted = client.extract_base_apk(saved, apk_path)
+            saved_path.unlink()
+            saved = extracted
+            saved_path = Path(saved)
+            size = saved_path.stat().st_size
+            console.print(f"[green]✓[/green] Extracted to [bold]{saved}[/bold]")
+        except (RuntimeError, OSError) as e:
+            err_console.print(
+                f"[yellow]XAPK extraction failed: {e}. Keeping original file.[/yellow]"
+            )
+            console.print(f"[green]✓[/green] Saved to [bold]{saved}[/bold]")
+    else:
+        console.print(f"[green]✓[/green] Saved to [bold]{saved}[/bold]")
+
     console.print(f"  Size: {client.human_size(size)}")
